@@ -1,99 +1,318 @@
 import './style.css'
 
-const cep = document.querySelector<HTMLInputElement>('#cep')!
-const logradouro = document.querySelector<HTMLInputElement>('#logradouro')!
-const numero = document.querySelector<HTMLInputElement>('#numero')!
-const bairro = document.querySelector<HTMLInputElement>('#bairro')!
-const cidade = document.querySelector<HTMLSelectElement>('#cidade')!
-const estado = document.querySelector<HTMLSelectElement>('#estado')!
+type StatusType = 'idle' | 'loading' | 'success' | 'error'
 
-const cidadesPorRegiao: Record<string, string[]> = {
-  'Norte': [
-    'Porto Velho', 'Ji-Paraná', 'Ariquemes', 'Vilhena', 'Cacoal',
-    'Guajará-Mirim', 'Rolim de Moura', 'Jaru', 'Pimenta Bueno',
-    'Machadinho d\'Oeste', 'Ouro Preto do Oeste', 'Buritis', 'Espigão d\'Oeste',
-    'Manaus', 'Belém', 'Rio Branco', 'Boa Vista', 'Macapá', 'Palmas'
-  ],
-  'Nordeste': ['Salvador', 'Fortaleza', 'Recife', 'Natal', 'Maceió', 'São Luís', 'João Pessoa', 'Aracaju', 'Teresina'],
-  'Centro-Oeste': ['Brasília', 'Goiânia', 'Cuiabá', 'Campo Grande'],
-  'Sudeste': ['São Paulo', 'Rio de Janeiro', 'Belo Horizonte', 'Vitória'],
-  'Sul': ['Curitiba', 'Porto Alegre', 'Florianópolis']
+type CepAddress = {
+  cep: string
+  street: string
+  neighborhood: string
+  city: string
+  state: string
 }
 
-const estadosPorRegiao: Record<string, string[]> = {
-  'Norte': ['AC', 'AP', 'AM', 'PA', 'RO', 'RR', 'TO'],
-  'Nordeste': ['AL', 'BA', 'CE', 'MA', 'PB', 'PE', 'PI', 'RN', 'SE'],
-  'Centro-Oeste': ['DF', 'GO', 'MT', 'MS'],
-  'Sudeste': ['ES', 'MG', 'RJ', 'SP'],
-  'Sul': ['PR', 'RS', 'SC']
-}
+const REQUEST_TIMEOUT_MS = 8000
+const ESTADOS = new Set([
+  'AC',
+  'AL',
+  'AP',
+  'AM',
+  'BA',
+  'CE',
+  'DF',
+  'ES',
+  'GO',
+  'MA',
+  'MT',
+  'MS',
+  'MG',
+  'PA',
+  'PB',
+  'PR',
+  'PE',
+  'PI',
+  'RJ',
+  'RN',
+  'RS',
+  'RO',
+  'RR',
+  'SC',
+  'SP',
+  'SE',
+  'TO',
+])
+
+const form = getElement<HTMLFormElement>('#address-form')
+const cep = getElement<HTMLInputElement>('#cep')
+const logradouro = getElement<HTMLInputElement>('#logradouro')
+const numero = getElement<HTMLInputElement>('#numero')
+const bairro = getElement<HTMLInputElement>('#bairro')
+const cidade = getElement<HTMLInputElement>('#cidade')
+const estado = getElement<HTMLSelectElement>('#estado')
+const buscar = getElement<HTMLButtonElement>('#buscar')
+const limpar = getElement<HTMLButtonElement>('#limpar')
+const statusMessage = getElement<HTMLDivElement>('#status-message')
+
+let activeController: AbortController | null = null
+let requestId = 0
+
+form.addEventListener('submit', (event) => {
+  event.preventDefault()
+  void consultarCep()
+})
+
+cep.addEventListener('input', () => {
+  if (activeController) {
+    activeController.abort()
+    activeController = null
+    requestId += 1
+    setLoading(false)
+  }
+
+  cep.value = formatarCep(cep.value)
+  cep.setCustomValidity('')
+  cep.setAttribute('aria-invalid', 'false')
+
+  if (somenteNumeros(cep.value).length < 8) {
+    limparEndereco()
+    setStatus('', 'idle')
+  }
+})
 
 cep.addEventListener('blur', () => {
-  consultarCep()
+  if (somenteNumeros(cep.value).length === 8) {
+    void consultarCep()
+  }
 })
 
-estado.addEventListener('change', () => {
-  atualizarCidades(estado.value)
+limpar.addEventListener('click', () => {
+  activeController?.abort()
+  activeController = null
+  requestId += 1
+  form.reset()
+  limparEndereco()
+  setLoading(false)
+  setStatus('', 'idle')
+  cep.setCustomValidity('')
+  cep.setAttribute('aria-invalid', 'false')
+  cep.focus()
 })
-
-function limparFormulario() {
-  logradouro.value = ""
-  numero.value = ""
-  bairro.value = ""
-  cidade.innerHTML = `<option value="">Selecione a cidade</option>`
-  estado.value = ""
-}
-
-limparFormulario()
 
 async function consultarCep() {
-  try {
-    const result = await fetch(`https://brasilapi.com.br/api/cep/v1/${cep.value}`)
-    if (!result.ok) throw new Error('CEP não encontrado')
+  const cepNumerico = somenteNumeros(cep.value)
 
-    const body = await result.json()
-    logradouro.value = body.street || ""
-    bairro.value = body.neighborhood || ""
-    estado.value = body.state || ""
-    atualizarCidades(body.state, body.city || "")
-    numero.focus()
-  } catch (e) {
-    alert("CEP não encontrado ou inválido.")
-    limparFormulario()
+  if (!cepValido(cepNumerico)) {
+    limparEndereco()
+    cep.setCustomValidity('Informe um CEP válido com 8 números.')
+    cep.setAttribute('aria-invalid', 'true')
+    setStatus('Informe um CEP válido com 8 números.', 'error')
+    cep.reportValidity()
     cep.focus()
+    return
+  }
+
+  activeController?.abort()
+  const controller = new AbortController()
+  activeController = controller
+  requestId += 1
+  const currentRequest = requestId
+  let timedOut = false
+  const timeoutId = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, REQUEST_TIMEOUT_MS)
+
+  setLoading(true)
+  setStatus('Consultando CEP...', 'loading')
+  cep.setAttribute('aria-invalid', 'false')
+
+  try {
+    const endereco = await buscarEndereco(cepNumerico, controller.signal)
+
+    if (currentRequest !== requestId) return
+
+    preencherEndereco(endereco)
+    cep.value = formatarCep(endereco.cep || cepNumerico)
+    cep.setCustomValidity('')
+    setStatus('Endereço encontrado. Confira o número antes de continuar.', 'success')
+    numero.focus()
+  } catch (error) {
+    if (currentRequest !== requestId) return
+
+    limparEndereco()
+    cep.setAttribute('aria-invalid', 'true')
+
+    if (isAbortError(error) && timedOut) {
+      setStatus('A consulta demorou demais. Tente novamente.', 'error')
+    } else if (!isAbortError(error)) {
+      setStatus('CEP não encontrado ou indisponível no momento.', 'error')
+    }
+  } finally {
+    window.clearTimeout(timeoutId)
+
+    if (currentRequest === requestId) {
+      setLoading(false)
+      activeController = null
+    }
   }
 }
 
-function atualizarCidades(siglaEstado: string, cidadeSelecionada: string = "") {
-  cidade.innerHTML = `<option value="">Selecione a cidade</option>`
-  let encontrou = false
+async function buscarEndereco(cepNumerico: string, signal: AbortSignal): Promise<CepAddress> {
+  const consultas = [consultarBrasilApi, consultarViaCep]
+  let ultimoErro: unknown = null
 
-  for (const [regiao, estados] of Object.entries(estadosPorRegiao)) {
-    if (estados.includes(siglaEstado)) {
-      const cidades = cidadesPorRegiao[regiao]
+  for (const consulta of consultas) {
+    try {
+      const endereco = await consulta(cepNumerico, signal)
 
-      if (cidadeSelecionada && !cidades.includes(cidadeSelecionada)) {
-        const option = document.createElement('option')
-        option.value = cidadeSelecionada
-        option.textContent = cidadeSelecionada
-        option.selected = true
-        cidade.appendChild(option)
-        encontrou = true
+      if (endereco) {
+        return endereco
+      }
+    } catch (error) {
+      if (isAbortError(error)) {
+        throw error
       }
 
-      cidades.forEach(c => {
-        const option = document.createElement('option')
-        option.value = c
-        option.textContent = c
-        if (c === cidadeSelecionada) option.selected = true
-        cidade.appendChild(option)
-      })
-
-      break
+      ultimoErro = error
     }
   }
 
-  if (!encontrou && cidadeSelecionada === "") {
-    cidade.selectedIndex = 0
+  if (ultimoErro instanceof Error) {
+    throw ultimoErro
   }
+
+  throw new Error('CEP não encontrado.')
+}
+
+async function consultarBrasilApi(
+  cepNumerico: string,
+  signal: AbortSignal,
+): Promise<CepAddress | null> {
+  const response = await fetch(`https://brasilapi.com.br/api/cep/v1/${encodeURIComponent(cepNumerico)}`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  })
+
+  if (response.status === 404) return null
+  if (!response.ok) throw new Error('BrasilAPI indisponível.')
+
+  const payload: unknown = await response.json()
+
+  if (!isRecord(payload)) {
+    throw new Error('Resposta inválida.')
+  }
+
+  return normalizarEndereco({
+    cep: getString(payload.cep) || cepNumerico,
+    street: getString(payload.street),
+    neighborhood: getString(payload.neighborhood),
+    city: getString(payload.city),
+    state: getString(payload.state),
+  })
+}
+
+async function consultarViaCep(
+  cepNumerico: string,
+  signal: AbortSignal,
+): Promise<CepAddress | null> {
+  const response = await fetch(`https://viacep.com.br/ws/${encodeURIComponent(cepNumerico)}/json/`, {
+    headers: { Accept: 'application/json' },
+    signal,
+  })
+
+  if (!response.ok) throw new Error('ViaCEP indisponível.')
+
+  const payload: unknown = await response.json()
+
+  if (!isRecord(payload)) {
+    throw new Error('Resposta inválida.')
+  }
+
+  if (payload.erro === true) {
+    return null
+  }
+
+  return normalizarEndereco({
+    cep: getString(payload.cep) || cepNumerico,
+    street: getString(payload.logradouro),
+    neighborhood: getString(payload.bairro),
+    city: getString(payload.localidade),
+    state: getString(payload.uf),
+  })
+}
+
+function normalizarEndereco(endereco: CepAddress): CepAddress {
+  const estadoNormalizado = endereco.state.trim().toUpperCase()
+
+  if (!endereco.city.trim() || !ESTADOS.has(estadoNormalizado)) {
+    throw new Error('Resposta de CEP incompleta.')
+  }
+
+  return {
+    cep: somenteNumeros(endereco.cep) || endereco.cep,
+    street: endereco.street.trim(),
+    neighborhood: endereco.neighborhood.trim(),
+    city: endereco.city.trim(),
+    state: estadoNormalizado,
+  }
+}
+
+function preencherEndereco(endereco: CepAddress) {
+  logradouro.value = endereco.street
+  bairro.value = endereco.neighborhood
+  cidade.value = endereco.city
+  estado.value = endereco.state
+}
+
+function limparEndereco() {
+  logradouro.value = ''
+  numero.value = ''
+  bairro.value = ''
+  cidade.value = ''
+  estado.value = ''
+}
+
+function setLoading(isLoading: boolean) {
+  form.classList.toggle('is-loading', isLoading)
+  buscar.disabled = isLoading
+  buscar.textContent = isLoading ? 'Consultando...' : 'Consultar'
+}
+
+function setStatus(message: string, type: StatusType) {
+  statusMessage.textContent = message
+  statusMessage.dataset.status = type
+}
+
+function cepValido(value: string) {
+  return /^\d{8}$/.test(value) && !/^(\d)\1{7}$/.test(value)
+}
+
+function formatarCep(value: string) {
+  const digits = somenteNumeros(value).slice(0, 8)
+  return digits.length > 5 ? `${digits.slice(0, 5)}-${digits.slice(5)}` : digits
+}
+
+function somenteNumeros(value: string) {
+  return value.replace(/\D/g, '')
+}
+
+function getString(value: unknown) {
+  return typeof value === 'string' ? value : ''
+}
+
+function getElement<T extends HTMLElement>(selector: string) {
+  const element = document.querySelector<T>(selector)
+
+  if (!element) {
+    throw new Error(`Elemento não encontrado: ${selector}`)
+  }
+
+  return element
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError'
 }
